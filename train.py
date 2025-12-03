@@ -15,7 +15,7 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(0)
 
 from data.collators import VQACollator, MMStarCollator
-from data.datasets import MMStarDataset, VQADataset
+from data.datasets import MMStarDataset, VQADataset, SIDataset
 from data.processors import get_image_processor, get_tokenizer
 from models.vision_language_model import VisionLanguageModel
 import models.config as config
@@ -39,32 +39,33 @@ def get_dataloaders(train_cfg, vlm_cfg):
     image_processor = get_image_processor(vlm_cfg.vit_img_size)
     tokenizer = get_tokenizer(vlm_cfg.lm_tokenizer)
 
-    # Load and combine all training datasets
-    combined_train_data = []
-    for dataset_name in train_cfg.train_dataset_name:
-        train_ds = load_dataset(train_cfg.train_dataset_path, dataset_name)
-        combined_train_data.append(train_ds['train'])
-    train_ds = concatenate_datasets(combined_train_data)
-    
-    test_ds = load_dataset(train_cfg.test_dataset_path)
-    train_ds = train_ds.shuffle(seed=0) # Shuffle the training dataset, so train and val get equal contributions from all concatinated datasets
+    # >>>>>>>>>> 替换开始：使用 SID 数据集 <<<<<<<<<<
+    # Load SID dataset (has 'train' and 'val' splits)
+    sid_dataset = load_dataset(train_cfg.train_dataset_path)  # e.g., "Lin-Chen/SID"
+
+    full_train_ds = sid_dataset['train']  # Use 'train' split for training+val
+    test_ds = sid_dataset['validation']          # Use original 'val' as test set
+
+    full_train_ds = full_train_ds.shuffle(seed=0)
 
     # Apply cutoff if specified
     if train_cfg.data_cutoff_idx is None:
-        total_samples = len(train_ds)  # Use the entire dataset
+        total_samples = len(full_train_ds)
     else:
-        total_samples = min(len(train_ds), train_cfg.data_cutoff_idx)
+        total_samples = min(len(full_train_ds), train_cfg.data_cutoff_idx)
 
     val_size = int(total_samples * train_cfg.val_ratio)
     train_size = total_samples - val_size
 
-    train_dataset = VQADataset(train_ds.select(range(train_size)), tokenizer, image_processor)
-    val_dataset = VQADataset(train_ds.select(range(train_size, total_samples)), tokenizer, image_processor)
-    test_dataset = MMStarDataset(test_ds['val'], tokenizer, image_processor)
+    train_dataset = SIDataset(full_train_ds.select(range(train_size)), tokenizer, image_processor)
+    val_dataset = SIDataset(full_train_ds.select(range(train_size, total_samples)), tokenizer, image_processor)
+    test_dataset = SIDataset(test_ds, tokenizer, image_processor)  # original 'val' as test
+    # >>>>>>>>>> 替换结束 <<<<<<<<<<
 
-    # Create collators
+    # Create collators — still use VQACollator for SID!
     vqa_collator = VQACollator(tokenizer, vlm_cfg.lm_max_length)
     mmstar_collator = MMStarCollator(tokenizer)
+    # We won't use MMStarCollator anymore, but keep it in case you switch back
 
     def seed_worker(worker_id):
         worker_seed = torch.initial_seed() % 2**32
@@ -107,7 +108,7 @@ def get_dataloaders(train_cfg, vlm_cfg):
         pin_memory=True,
         worker_init_fn=seed_worker,
         generator=g,
-        )
+    )
 
     return train_loader, val_loader, test_loader
 
@@ -135,6 +136,66 @@ def test_mmstar(model, tokenizer, test_loader, device):
     model.train()
     accuracy = correct_predictions / total_examples if total_examples > 0 else 0
     return accuracy
+
+def test_sid(model, tokenizer, test_loader, device):
+    model.eval()
+    total = 0
+    correct = 0
+
+    with torch.no_grad():
+        for batch in test_loader:
+            images = batch["images"].to(device)
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["labels"].to(device)  # [B, T]
+
+            batch_size = input_ids.size(0)
+
+            # 1) 从 labels 提取“答案文本”
+            gt_answers = []
+            for i in range(batch_size):
+                label_ids = labels[i]
+                # 只取 label != -100 的 token，忽略问题部分
+                ans_ids = label_ids[label_ids != -100]
+                if ans_ids.numel() == 0:
+                    gt_answers.append("")
+                else:
+                    gt = tokenizer.decode(ans_ids, skip_special_tokens=True)
+                    gt_answers.append(gt.strip().lower())
+
+            # 2) 让模型生成答案
+            gen_ids = model.generate(input_ids, images, attention_mask)
+            pred_answers = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
+            pred_answers = [p.strip().lower() for p in pred_answers]
+
+            # 3) 比较预测和真实答案
+            for pred, gt in zip(pred_answers, gt_answers):
+                # 可选：把答案简化成标签
+                # 例如 "the image is real" -> "real"
+                if "real" in gt:
+                    gt_label = "real"
+                elif "tampered" in gt:
+                    gt_label = "tampered"
+                elif "full" in gt and "synthetic" in gt:
+                    gt_label = "full_synthetic"
+                else:
+                    gt_label = gt  # fallback
+
+                if "real" in pred:
+                    pred_label = "real"
+                elif "tampered" in pred:
+                    pred_label = "tampered"
+                elif "full" in pred and "synthetic" in pred:
+                    pred_label = "full_synthetic"
+                else:
+                    pred_label = pred  # fallback
+
+                if gt_label == pred_label:
+                    correct += 1
+                total += 1
+
+    model.train()
+    return correct / total if total > 0 else 0.0
 
 # Cosine learning rate schedule with warmup (from Karpathy)
 # https://github.com/karpathy/build-nanogpt/blob/master/train_gpt2.py#L353
@@ -164,7 +225,7 @@ def train(train_cfg, vlm_cfg):
             run_name = run_name.replace("full_ds", f"{total_dataset_size}samples")
         run = wandb.init(
             entity=train_cfg.wandb_entity,
-            project="nanoVLM",
+            project="nanoVLM_deepfake",
             config={
                 "VLMConfig": asdict(vlm_cfg),
                 "TrainConfig": asdict(train_cfg)
@@ -239,7 +300,7 @@ def train(train_cfg, vlm_cfg):
                 model.eval()
                 torch.cuda.empty_cache()  # Clear GPU memory
                 with torch.no_grad():
-                    epoch_accuracy = test_mmstar(model, tokenizer, test_loader, device)
+                    epoch_accuracy = test_sid(model, tokenizer, test_loader, device)
                     total_val_loss = 0
                     for batch in val_loader:
                         images = batch["image"].to(device)
@@ -293,7 +354,7 @@ def train(train_cfg, vlm_cfg):
     print(f"Average time per epoch: {avg_epoch_time:.2f}s")
     print(f"Average time per sample: {avg_time_per_sample:.4f}s")
 
-    accuracy = test_mmstar(model, tokenizer, test_loader, device)
+    accuracy = test_sid(model, tokenizer, test_loader, device)
     print(f"MMStar Accuracy: {accuracy:.4f}")
 
     if train_cfg.log_wandb:

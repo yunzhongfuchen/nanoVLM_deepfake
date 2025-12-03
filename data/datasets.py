@@ -90,3 +90,54 @@ class MMStarDataset(Dataset):  # https://huggingface.co/datasets/Lin-Chen/MMStar
             "answer": answer
         }
     
+import torch
+import numpy as np
+from PIL import Image
+from torch.utils.data import Dataset
+import models.config as cfg
+
+
+class SIDataset(Dataset):
+    """Synthetic Image Detection Dataset - 分辨真实/合成/篡改图像"""
+    def __init__(self, dataset, tokenizer, image_processor):
+        self.dataset = dataset
+        self.tokenizer = tokenizer
+        self.image_processor = image_processor
+        self.label_map = {
+            0: "this is real image.",
+            1: "this is full synthetic image.",
+            2: "this is tampered image."
+        }
+        # 优化问题提示，使其更适合生成任务
+        self.question_prompt = "Question: Is this image real, full synthetic or tampered? Answer:"
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        item = self.dataset[idx]
+        
+        # 处理图像
+        image = item['image']
+        if not isinstance(image, Image.Image):
+            print(f"Invalid image type at index {idx}, expected PIL.Image")
+            processed_image = torch.zeros(
+                3, cfg.VLMConfig.vit_img_size, cfg.VLMConfig.vit_img_size
+            )
+        else:
+            if image.mode != 'RGB':
+                image = image.convert('RGB')
+            processed_image = self.image_processor(image)
+        
+        # 处理label并生成答案
+        label = item['label']
+        if label not in self.label_map:
+            raise ValueError(f"Invalid label {label} at index {idx}. Must be 0, 1, or 2.")
+        
+        answer = self.label_map[label] + self.tokenizer.eos_token * 3
+        
+        return {
+            "image": processed_image,
+            "text_data": self.question_prompt,  # 固定的问题提示
+            "answer": answer  # 包含EOS的答案
+        }
