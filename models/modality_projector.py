@@ -43,4 +43,77 @@ class ModalityProjector(nn.Module):
 
         return x
 
+# models/fusion_layer.py
+import torch
+import torch.nn as nn
+
+class CrossAttentionFusion(nn.Module):
+    """
+    A trainable, reusable cross-attention fusion module.
     
+    - Maintains learnable parameters (Linear layers)
+    - Can be trained with backprop
+    - Compatible with your VLM pipeline
+    """
+    def __init__(self, cfg):
+        super().__init__()
+        self.embed_dim = cfg.vit_hidden_dim  # e.g., 768
+        self.num_heads = getattr(cfg, 'fusion_num_heads', 8)
+        assert self.embed_dim % self.num_heads == 0
+
+        # Learnable projection layers
+        self.proj_q = nn.Linear(self.embed_dim, self.embed_dim)
+        self.proj_k = nn.Linear(self.embed_dim, self.embed_dim)
+        self.proj_v = nn.Linear(self.embed_dim, self.embed_dim)
+
+        # Dropout for training stability
+        self.dropout = nn.Dropout(getattr(cfg, 'fusion_dropout', 0.1))
+
+        # Initialize properly
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize projections"""
+        for m in [self.proj_q, self.proj_k, self.proj_v]:
+            nn.init.normal_(m.weight, mean=0.0, std=0.02)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+
+    def forward(self, vit_features, cn_features):
+        """
+        Fuse ViT and CNN features using cross-attention.
+
+        Args:
+            vit_features: [B, 196, 768] ← Query path
+            cn_features:  [B, 49, 768]  ← Key/Value source
+
+        Returns:
+            fused: [B, 196, 768] — same shape as input
+        """
+        B, N_vit, D = vit_features.shape
+        _, N_cn, _ = cn_features.shape
+
+        # Project to unified space
+        q = self.proj_q(vit_features)   # [B,196,D]
+        k = self.proj_k(cn_features)    # [B,49,D]
+        v = self.proj_v(cn_features)    # [B,49,D]
+
+        # Reshape for multi-head attention
+        q = q.view(B, N_vit, self.num_heads, D // self.num_heads).transpose(1, 2)  # [B,h,N,d]
+        k = k.view(B, N_cn, self.num_heads, D // self.num_heads).transpose(1, 2)   # [B,h,N,d]
+        v = v.view(B, N_cn, self.num_heads, D // self.num_heads).transpose(1, 2)   # [B,h,N,d]
+
+        # Scaled dot-product attention
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v,
+            dropout_p=self.dropout.p if self.training else 0.0,
+            is_causal=False
+        )
+
+        # Reshape back
+        attn_output = attn_output.transpose(1, 2).contiguous().view(B, N_vit, D)
+
+        # Residual connection
+        fused = vit_features + attn_output  # [B,196,768]
+
+        return fused

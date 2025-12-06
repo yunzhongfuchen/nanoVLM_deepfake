@@ -14,6 +14,12 @@ class VLMConfig:
     vit_cls_flag: bool = False
     vit_model_type: str = 'google/siglip-base-patch16-224'
 
+    # --- ConvNeXtV2 Encoder ---
+    convnext_model_type = 'timm/convnextv2_base.fcmae_ft_in1k'
+    convnext_img_size = 224
+    convnext_hidden_dim = 768
+    convnext_dropout = 0.0
+
     lm_hidden_dim: int = 576
     lm_inter_dim: int = 1536
     lm_rms_eps: float = 1e-5

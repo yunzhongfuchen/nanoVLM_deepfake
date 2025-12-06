@@ -6,8 +6,9 @@ from typing import Optional
 
 
 from models.vision_transformer import ViT
+from models.convnext_v2 import ConvNeXtV2
 from models.language_model import LanguageModel
-from models.modality_projector import ModalityProjector
+from models.modality_projector import ModalityProjector, CrossAttentionFusion
 from models.config import VLMConfig
 
 import torch
@@ -23,14 +24,19 @@ class VisionLanguageModel(nn.Module):
             print("Loading from backbone weights")
             self.vision_encoder = ViT.from_pretrained(cfg)
             self.decoder = LanguageModel.from_pretrained(cfg)
+            self.vision_encoder_conv = ConvNeXtV2.from_pretrained(cfg)
         else:
             self.vision_encoder = ViT(cfg)
             self.decoder = LanguageModel(cfg)
+            self.vision_encoder_conv = ConvNeXtV2(cfg)
         self.MP = ModalityProjector(cfg)
+        self.CAF = CrossAttentionFusion(cfg)
         self.load_backbone = load_backbone
 
     def forward(self, input_ids, image, attention_mask=None, targets=None):
         image_embd = self.vision_encoder(image)
+        image_embd_conv = self.vision_encoder_conv(image)
+        image_embd = self.CAF(image_embd, image_embd_conv)
         image_embd = self.MP(image_embd)
 
         token_embd = self.decoder.token_embedding(input_ids)
@@ -62,6 +68,8 @@ class VisionLanguageModel(nn.Module):
     def generate(self, input_ids, image, attention_mask=None, max_new_tokens=5):
         # Process image through vision encoder and projection
         image_embd = self.vision_encoder(image)
+        image_embd_conv = self.vision_encoder_conv(image)
+        image_embd = self.CAF(image_embd, image_embd_conv)
         image_embd = self.MP(image_embd)
         
         # Embed initial tokens
