@@ -89,13 +89,9 @@ class MMStarDataset(Dataset):  # https://huggingface.co/datasets/Lin-Chen/MMStar
             "text_data": formatted_text,
             "answer": answer
         }
-    
-import torch
-import numpy as np
-from PIL import Image
-from torch.utils.data import Dataset
-import models.config as cfg
 
+
+import numpy as np
 
 class SIDataset(Dataset):
     """Synthetic Image Detection Dataset - 分辨真实/合成/篡改图像"""

@@ -61,7 +61,7 @@ def main():
     print("\nInput:\n ", args.prompt, "\n\nOutputs:")
     for i in range(args.generations):
         gen = model.generate(tokens, img_t, max_new_tokens=args.max_new_tokens)
-        out = tokenizer.batch_decode(gen, skip_special_tokens=True)[0]
+        out = tokenizer.batch_decode(gen, skip_special_tokens=False)[0]
         print(f"  >> Generation {i+1}: {out}")
 
 

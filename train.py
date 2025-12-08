@@ -39,6 +39,83 @@ def get_dataloaders(train_cfg, vlm_cfg):
     image_processor = get_image_processor(vlm_cfg.vit_img_size)
     tokenizer = get_tokenizer(vlm_cfg.lm_tokenizer)
 
+    # Load and combine all training datasets
+    combined_train_data = []
+    for dataset_name in train_cfg.train_dataset_name:
+        train_ds = load_dataset(train_cfg.train_dataset_path, dataset_name)
+        combined_train_data.append(train_ds['train'])
+    train_ds = concatenate_datasets(combined_train_data)
+    
+    test_ds = load_dataset(train_cfg.test_dataset_path)
+    train_ds = train_ds.shuffle(seed=0) # Shuffle the training dataset, so train and val get equal contributions from all concatinated datasets
+
+    # Apply cutoff if specified
+    if train_cfg.data_cutoff_idx is None:
+        total_samples = len(train_ds)  # Use the entire dataset
+    else:
+        total_samples = min(len(train_ds), train_cfg.data_cutoff_idx)
+
+    val_size = int(total_samples * train_cfg.val_ratio)
+    train_size = total_samples - val_size
+
+    train_dataset = VQADataset(train_ds.select(range(train_size)), tokenizer, image_processor)
+    val_dataset = VQADataset(train_ds.select(range(train_size, total_samples)), tokenizer, image_processor)
+    test_dataset = MMStarDataset(test_ds['val'], tokenizer, image_processor)
+
+    # Create collators
+    vqa_collator = VQACollator(tokenizer, vlm_cfg.lm_max_length)
+    mmstar_collator = MMStarCollator(tokenizer)
+
+    def seed_worker(worker_id):
+        worker_seed = torch.initial_seed() % 2**32
+        numpy.random.seed(worker_seed)
+        random.seed(worker_seed)
+
+    g = torch.Generator()
+    g.manual_seed(0)
+
+    # Create dataloaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=train_cfg.batch_size,
+        shuffle=True,
+        collate_fn=vqa_collator,
+        num_workers=8,
+        pin_memory=True,
+        drop_last=True,
+        worker_init_fn=seed_worker,
+        generator=g,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=train_cfg.batch_size,
+        shuffle=False,
+        collate_fn=vqa_collator,
+        num_workers=8,
+        pin_memory=True,
+        drop_last=True,
+        worker_init_fn=seed_worker,
+        generator=g,
+    )
+
+    test_loader = DataLoader(
+        test_dataset, 
+        batch_size=train_cfg.mmstar_batch_size, 
+        shuffle=False, 
+        collate_fn=mmstar_collator,
+        pin_memory=True,
+        worker_init_fn=seed_worker,
+        generator=g,
+        )
+
+    return train_loader, val_loader, test_loader
+
+def get_dataloaders_linux(train_cfg, vlm_cfg):
+    # Create datasets
+    image_processor = get_image_processor(vlm_cfg.vit_img_size)
+    tokenizer = get_tokenizer(vlm_cfg.lm_tokenizer)
+
     # >>>>>>>>>> 替换开始：使用 SID 数据集 <<<<<<<<<<
     # Load SID dataset (has 'train' and 'val' splits)
     sid_dataset = load_dataset(train_cfg.train_dataset_path)  # e.g., "Lin-Chen/SID"
@@ -137,7 +214,7 @@ def test_mmstar(model, tokenizer, test_loader, device):
     accuracy = correct_predictions / total_examples if total_examples > 0 else 0
     return accuracy
 
-def test_sid(model, tokenizer, test_loader, device):
+def test_auth_dataset(model, tokenizer, test_loader, device):
     model.eval()
     total = 0
     correct = 0
@@ -215,7 +292,7 @@ def get_lr(it, max_lr, max_steps):
     return min_lr + coeff * (max_lr - min_lr)
 
 def train(train_cfg, vlm_cfg):
-    train_loader, val_loader, test_loader = get_dataloaders(train_cfg, vlm_cfg)
+    train_loader, val_loader, test_loader = get_dataloaders_linux(train_cfg, vlm_cfg)
     tokenizer = get_tokenizer(vlm_cfg.lm_tokenizer)
 
     total_dataset_size = len(train_loader.dataset)
@@ -225,7 +302,7 @@ def train(train_cfg, vlm_cfg):
             run_name = run_name.replace("full_ds", f"{total_dataset_size}samples")
         run = wandb.init(
             entity=train_cfg.wandb_entity,
-            project="nanoVLM_deepfake",
+            project="nanoVLM-deepfake",
             config={
                 "VLMConfig": asdict(vlm_cfg),
                 "TrainConfig": asdict(train_cfg)
@@ -300,7 +377,7 @@ def train(train_cfg, vlm_cfg):
                 model.eval()
                 torch.cuda.empty_cache()  # Clear GPU memory
                 with torch.no_grad():
-                    epoch_accuracy = test_sid(model, tokenizer, test_loader, device)
+                    epoch_accuracy = test_auth_dataset(model, tokenizer, test_loader, device)
                     total_val_loss = 0
                     for batch in val_loader:
                         images = batch["image"].to(device)
@@ -354,7 +431,7 @@ def train(train_cfg, vlm_cfg):
     print(f"Average time per epoch: {avg_epoch_time:.2f}s")
     print(f"Average time per sample: {avg_time_per_sample:.4f}s")
 
-    accuracy = test_sid(model, tokenizer, test_loader, device)
+    accuracy = test_auth_dataset(model, tokenizer, test_loader, device)
     print(f"MMStar Accuracy: {accuracy:.4f}")
 
     if train_cfg.log_wandb:

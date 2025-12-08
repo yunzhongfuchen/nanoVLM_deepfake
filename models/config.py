@@ -40,8 +40,8 @@ class VLMConfig:
 
 @dataclass
 class TrainConfig:
-    lr_mp: float = 2e-3
-    lr_backbones: float = 1e-4
+    lr_mp: float = 1e-4#2e-3
+    lr_backbones: float = 5e-5#1e-4
     data_cutoff_idx: int = None
     val_ratio: float = 0.01
     batch_size: int = 256
