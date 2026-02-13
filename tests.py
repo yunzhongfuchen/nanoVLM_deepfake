@@ -1,180 +1,160 @@
-import argparse
+# test_cls_token_extraction.py
+# 完整测试 VisionLanguageModel 中 [CLS] token 的提取逻辑
+
 import torch
-from PIL import Image
-
-torch.manual_seed(0)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(0)
-
+import os
 from models.vision_language_model import VisionLanguageModel
-from data.processors import get_tokenizer, get_image_processor
-from datasets import load_dataset
+from models.config import VLMConfig
+from transformers import AutoTokenizer
 
+print("🧪 开始测试：[CLS] token 提取逻辑（已修复 pad_token 问题）")
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Batch evaluate nanoVLM on SID validation set")
-    parser.add_argument(
-        "--checkpoint", type=str, default=None,
-        help="Path to a local checkpoint (directory or safetensors/pth). If omitted, we pull from HF."
-    )
-    parser.add_argument(
-        "--hf_model", type=str, default="lusxvr/nanoVLM-222M",
-        help="HuggingFace repo ID to download from if --checkpoint is not set."
-    )
-    parser.add_argument(
-        "--dataset", type=str, default="saberzl/SID_Set",
-        help="Dataset name to load. Must have a 'validation' split."
-    )
-    parser.add_argument(
-        "--split", type=str, default="validation",
-        help="Dataset split to evaluate on (e.g., 'validation', 'test')"
-    )
-    parser.add_argument(
-        "--max_new_tokens", type=int, default=32,
-        help="Maximum number of tokens to generate per answer"
-    )
-    parser.add_argument(
-        "--limit", type=int, default=None,
-        help="Limit number of samples for quick testing (e.g., 100)"
-    )
-    parser.add_argument(
-        "--print_examples", type=int, default=5,
-        help="Number of (pred, gt) examples to print"
-    )
-    return parser.parse_args()
+# ==================================================
+# 1. 加载配置与 tokenizer
+# ==================================================
 
+cfg = VLMConfig()
+tokenizer_name = cfg.lm_tokenizer  # 'HuggingFaceTB/cosmo2-tokenizer'
 
-def normalize_answer(text):
-    """将模型输出归一化为三类标签"""
-    t = text.lower()
-    if 'real' in t and 'synthetic' not in t and 'tampered' not in t:
-        return 'real'
-    elif 'tampered' in t or 'manipulated' in t or 'edited' in t or 'spliced' in t:
-        return 'tampered'
-    elif 'synthetic' in t or 'generated' in t or 'ai' in t or 'fake' in t or 'full' in t:
-        return 'full_synthetic'
+print(f"Loading tokenizer: {tokenizer_name}")
+try:
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+except Exception as e:
+    print(f"❌ 无法加载 tokenizer，请检查网络或缓存")
+    raise e
+
+# --------------------------------------------------
+# ✅ 关键修复：设置 pad_token
+# --------------------------------------------------
+if tokenizer.pad_token is None:
+    if tokenizer.eos_token is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+        print(f"🔧 已设置 pad_token = eos_token ('{tokenizer.eos_token}')")
     else:
-        # fallback: keyword matching
-        if 'real' in t:
-            return 'real'
-        if any(k in t for k in ['synth', 'fake', 'ai', 'gen', 'computer']):
-            return 'full_synthetic'
-        if any(k in t for k in ['tamper', 'edit', 'manipulat', 'alter']):
-            return 'tampered'
-        return 'unknown'
+        # 如果连 eos_token 都没有，就添加一个
+        tokenizer.add_special_tokens({'eos_token': '</s>'})
+        tokenizer.pad_token = tokenizer.eos_token
+        print(f"🔧 已补充 eos_token 和 pad_token (token='</s>')")
 
+print(f"✅ pad_token = '{tokenizer.pad_token}', id={tokenizer.pad_token_id}")
 
-def extract_gt_label(label_id):
-    """SID dataset 中 label: 0=real, 1=full synthetic, 2=tampered"""
-    label_map = {
-        0: 'real',
-        1: 'full_synthetic',
-        2: 'tampered'
-    }
-    return label_map.get(label_id, 'unknown')
+# --------------------------------------------------
+# ✅ 确保 [CLS] token 存在
+# --------------------------------------------------
+if "[CLS]" not in tokenizer.get_vocab():
+    num_added = tokenizer.add_tokens(["[CLS]"])
+    print(f"🟢 成功添加 [CLS] token (共新增 {num_added} 个 token)")
+else:
+    print("🟢 [CLS] 已存在于词汇表中")
 
+# 更新 vocab size 到 config（模拟 resize 前状态）
+original_vocab_size = len(tokenizer)
 
-def main():
-    args = parse_args()
+# ==================================================
+# 2. 创建模型实例（不加载 backbone 权重）
+# ==================================================
 
-    # Device setup
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
-    print(f"Using device: {device}")
+print("\n🧠 创建 VisionLanguageModel 实例...")
+model = VisionLanguageModel(cfg, load_backbone=False)  # 无需加载预训练权重
+model.decoder.resize_token_embeddings(len(tokenizer))
+model.eval()
 
-    # Load model
-    source = args.checkpoint if args.checkpoint else args.hf_model
-    print(f"Loading weights from: {source}")
-    model = VisionLanguageModel.from_pretrained(source).to(device)
-    model.eval()
+# 🔁 如果你已经实现了 resize_token_embeddings，请取消注释以下两行：
+# print(f"🔄 调用 decoder.resize_token_embeddings({len(tokenizer)})")
+# model.decoder.resize_token_embeddings(len(tokenizer))
 
-    # Tokenizer & image processor
-    tokenizer = get_tokenizer(model.cfg.lm_tokenizer)
-    image_processor = get_image_processor(model.cfg.vit_img_size)
+print(f"✅ 模型创建成功")
+print(f"   分类头结构: {model.classifier}")
 
-    # Prompt template
-    question = "Is this image real, full synthetic or tampered?"
-    prompt = f"Question: {question} Answer:"
+print("\n" + "="*60)
+print("1️⃣ 测试 forward 函数中的 [CLS] 提取")
+print("="*60)
 
-    # Encode prompt once
-    encoded = tokenizer(prompt, return_tensors="pt", add_special_tokens=True)
-    input_ids = encoded["input_ids"].to(device)
-    attention_mask = encoded["attention_mask"].to(device)
+# ==================================================
+# 构造测试输入
+# ==================================================
 
-    # Load SID dataset
-    print(f"Loading dataset '{args.dataset}' split '{args.split}'...")
-    dataset = load_dataset(args.dataset)[args.split]
-    if args.limit:
-        dataset = dataset.select(range(min(args.limit, len(dataset))))
+texts = [
+    "[CLS] A cat is sitting on the grass.",
+    "[CLS] An urban cityscape with tall buildings at night."
+]
 
-    print(f"Starting evaluation on {len(dataset)} samples...")
+# 使用 tokenizer 编码，并启用 padding/truncation
+inputs = tokenizer(
+    texts,
+    return_tensors="pt",
+    padding=True,
+    truncation=True,
+    max_length=512  # 避免 warning
+)
 
-    total = 0
-    correct = 0
-    print_examples = []
+input_ids = inputs["input_ids"]         # [2, T]
+attention_mask = inputs["attention_mask"]  # [2, T]
 
-    with torch.no_grad():
-        for i, item in enumerate(dataset):
-            # Get image and label
-            try:
-                image = item["image"]
-                if not isinstance(image, Image.Image):
-                    image = Image.fromarray(image)
-                image = image.convert("RGB")
-                img_tensor = image_processor(image).unsqueeze(0).to(device)  # [1, C, H, W]
+# ==================================================
+# 打印并验证输入格式
+# ==================================================
 
-                label = item["label"]
-                gt_label = extract_gt_label(label)
-                if gt_label == 'unknown':
-                    continue
+print("📝 输入文本:")
+for i, text in enumerate(texts):
+    print(f"  [{i}] {text}")
 
-                # Generate
-                gen_ids = model.generate(
-                    input_ids, 
-                    img_tensor, 
-                    attention_mask, 
-                    max_new_tokens=args.max_new_tokens  # 假设你的 generate 支持这个参数
-                )
-                pred_text = tokenizer.decode(gen_ids[0], skip_special_tokens=True)
-                pred_label = normalize_answer(pred_text)
+print(f"\n🔢 input_ids.shape: {tuple(input_ids.shape)}")
+print(f"第一个样本的第一个 token ID: {input_ids[0, 0].item()}")
+print(f"[CLS] 的 token ID: {tokenizer.convert_tokens_to_ids('[CLS]')}")
 
-                # Record for printing
-                if len(print_examples) < args.print_examples:
-                    print_examples.append({
-                        'gt': gt_label,
-                        'pred': pred_label,
-                        'raw': pred_text
-                    })
+assert input_ids[0, 0].item() == tokenizer.convert_tokens_to_ids("[CLS]") and \
+       input_ids[1, 0].item() == tokenizer.convert_tokens_to_ids("[CLS]"), \
+    "❌ 错误：输入未以 [CLS] 开头"
 
-                if pred_label == gt_label:
-                    correct += 1
-                total += 1
+print("✅ 所有输入均以 [CLS] 开头 ✔️")
 
-                if (i + 1) % 10 == 0 or (i + 1) == len(dataset):
-                    print(f"Processed {i+1}/{len(dataset)} | Current Acc: {correct/total:.3f}")
+# ==================================================
+# 前向传播测试
+# ==================================================
 
-            except Exception as e:
-                print(f"Error processing sample {i}: {str(e)}")
-                continue
+images = torch.randn(2, 3, 224, 224)  # B=2, C=3, H=224, W=224
 
-    # Final results
-    accuracy = correct / total if total > 0 else 0
-    print("\n" + "="*50)
-    print(f"✅ Evaluation Complete")
-    print(f"Total Samples: {total}")
-    print(f"Accuracy: {accuracy:.4f} ({correct}/{total})")
-    print("="*50)
+with torch.no_grad():
+    lm_logits, total_loss, class_logits = model(
+        input_ids=input_ids,
+        image=images,
+        attention_mask=attention_mask,
+        targets=input_ids.clone(),      # mock target for gen loss
+        targets_cls=torch.tensor([0, 2])  # fake labels for classification
+    )
 
-    # Print some examples
-    print(f"\n🔍 First {len(print_examples)} predictions:")
-    for idx, ex in enumerate(print_examples):
-        status = "✅" if ex['gt'] == ex['pred'] else "❌"
-        print(f"{idx+1}. {status} GT={ex['gt']}, Pred={ex['pred']} | '{ex['raw']}'")
+print(f"\n🔍 输出形状:")
+print(f"  lm_logits.shape     : {tuple(lm_logits.shape)}")
+print(f"  total_loss          : {total_loss.item():.4f}")
+print(f"  class_logits.shape  : {tuple(class_logits.shape)} → 应为 (2, 3)")
 
+assert class_logits.shape == (2, 3), "分类 logits 形状错误"
+print("✅ class_logits 形状正确 ✅")
 
-if __name__ == "__main__":
-    main()
+# ==================================================
+# 手动复现 cls_position 提取过程（调试用）
+# ==================================================
+
+image_embd = model.vision_encoder(images)
+image_embd = model.MP(image_embd)
+img_seq_len = image_embd.size(1)
+
+print(f"\n📊 图像 token 序列长度: {img_seq_len}")
+print(f"cls_position = img_seq_len = {img_seq_len}")
+
+token_embd = model.decoder.token_embedding(input_ids)
+combined_embd = torch.cat((image_embd, token_embd), dim=1)
+
+# 获取隐藏状态
+hidden_states = model.decoder(combined_embd, attention_mask)
+
+# 手动提取 [CLS] 表示
+cls_hidden_state = hidden_states[:, img_seq_len:img_seq_len+1, :]  # [2,1,D]
+manual_class_logits = model.classifier(cls_hidden_state).squeeze(1)
+
+diff = (manual_class_logits - class_logits).abs().max()
+print(f"手动计算 vs 模型内部输出最大差异: {diff:.6f}")
+assert diff < 1e-5, "推理结果不一致"
+
+print("🟢 手动验证通过！[CLS] 提取逻辑完全正确。")

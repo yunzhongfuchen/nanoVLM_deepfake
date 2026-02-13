@@ -8,12 +8,13 @@ from typing import Optional
 from models.vision_transformer import ViT
 from models.language_model import LanguageModel
 from models.modality_projector import ModalityProjector
+from models.segmentation import ViTMAEDecoder
 from models.config import VLMConfig
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from safetensors.torch import load_model, save_model
+from safetensors.torch import load_model, save_model, load_file
 
 class VisionLanguageModel(nn.Module):
     def __init__(self, cfg: VLMConfig, load_backbone=True):
@@ -27,9 +28,21 @@ class VisionLanguageModel(nn.Module):
             self.vision_encoder = ViT(cfg)
             self.decoder = LanguageModel(cfg)
         self.MP = ModalityProjector(cfg)
+        # === 分类头：从 [CLS] 向量预测类别 ===
+        # 我们使用一个小型 MLP：hidden_size -> hidden_size -> num_classes
+        self.hidden_size = cfg.lm_hidden_dim  # 用于分类头
+        self.num_classes = 3  # 三分类任务
+        self.classifier = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size),
+            nn.ReLU(),
+            nn.Dropout(0.1),  # 可调
+            nn.Linear(self.hidden_size, self.num_classes)
+        )
+        # 视觉解码器
+        self.vision_decoder = ViTMAEDecoder(freeze_decoder=False)
         self.load_backbone = load_backbone
 
-    def forward(self, input_ids, image, attention_mask=None, targets=None):
+    def forward(self, input_ids, image, attention_mask, targets, targets_cls):
         image_embd = self.vision_encoder(image)
         image_embd = self.MP(image_embd)
 
@@ -47,8 +60,19 @@ class VisionLanguageModel(nn.Module):
             # Combine image and token attention masks
             attention_mask = torch.cat((image_attention_mask, attention_mask), dim=1)
 
-        logits = self.decoder(combined_embd, attention_mask) # Not logits yet, but easier to return like this
+        # === 注意：此时 logits 实际上是隐藏状态（not final logits）===
+        logits = self.decoder(combined_embd, attention_mask)  # [B, N_img+T, D]
 
+        # === 提取 [CLS] 位置进行分类（必须在这一步完成，因为后面会覆盖 logits）===
+        cls_position = image_embd.size(1)  # [CLS] 在拼接后的位置
+        cls_hidden_state = logits[:, cls_position:cls_position+1, :]  # [B, 1, D]
+        class_logits = self.classifier(cls_hidden_state).squeeze(1)  # [B, 3]
+
+        cls_loss = None
+        if targets_cls is not None:
+            cls_loss = F.cross_entropy(class_logits, targets_cls)
+
+        # === 现在可以安全地将 logits 改写为语言建模输出 ===
         loss = None
         if targets is not None:
             # Only use the token part of the logits for loss computation
@@ -56,10 +80,21 @@ class VisionLanguageModel(nn.Module):
             logits = logits[:, image_embd.size(1):, :]
             loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-100)
 
-        return logits, loss
+        # === 合并总损失 ===
+        total_loss = None
+        if loss is not None and cls_loss is not None:
+            total_loss = loss + cls_loss
+        elif loss is not None:
+            total_loss = loss
+        elif cls_loss is not None:
+            total_loss = cls_loss
+
+        # === 返回三项结果 ===
+        return logits, total_loss, class_logits
+
 
     @torch.no_grad()
-    def generate(self, input_ids, image, attention_mask=None, max_new_tokens=5):
+    def generate(self, input_ids, image, attention_mask=None, max_new_tokens=20):
         # Process image through vision encoder and projection
         image_embd = self.vision_encoder(image)
         image_embd = self.MP(image_embd)
@@ -78,6 +113,13 @@ class VisionLanguageModel(nn.Module):
             image_attention_mask = torch.ones((batch_size, img_seq_len), device=attention_mask.device, dtype=attention_mask.dtype)
             attention_mask = torch.cat((image_attention_mask, attention_mask), dim=1)
         
+        # === 🔽 新增：使用完整上下文提取 [CLS] 并分类 ===
+        hidden_states = self.decoder(combined_embd, attention_mask)  # 获取上下文表示
+        cls_hidden = hidden_states[:, img_seq_len:img_seq_len+1, :]  # 提取 [CLS] 对应的隐藏状态
+        class_logits = self.classifier(cls_hidden).squeeze(1)         # 分类头输出
+        cls_pred = class_logits.argmax(dim=-1)                      # 预测类别 [B]
+        # === 🔼 新增结束 ===
+
         # Generate from combined embeddings using the decoder
         # We need to use the decoder's forward function and not its generate method
         # because we want to keep track of the image prefix
@@ -107,7 +149,9 @@ class VisionLanguageModel(nn.Module):
             if attention_mask is not None:
                 attention_mask = torch.cat((attention_mask, torch.ones((batch_size, 1), device=attention_mask.device)), dim=1)
         
-        return generated_tokens
+        # === ✅ 修改返回值 ===
+        return generated_tokens, cls_pred
+
 
     @classmethod
     def from_pretrained(
@@ -153,10 +197,21 @@ class VisionLanguageModel(nn.Module):
         # Initialize model without loading the backbone
         model = cls(cfg, load_backbone=False)
 
-        # Load safetensors weights
-        load_model(model, weights_path)
+        # === 修改此处：替换原 load_model(model, weights_path) ==
 
-        # Done!
+        # 获取模型设备（安全处理无参数情况）
+        device = next(model.parameters()).device if next(model.parameters(), None) is not None else torch.device("cpu")
+        
+        # 加载并过滤：仅保留键存在且形状匹配的参数
+        state_dict = load_file(weights_path, device=str(device))
+        filtered_state_dict = {
+            k: v for k, v in state_dict.items()
+            if k in model.state_dict() and v.shape == model.state_dict()[k].shape
+        }
+        model.load_state_dict(filtered_state_dict, strict=False)  # strict=False 允许模型有额外参数
+        print("✅ Model loaded")
+        # === 修改结束 ===
+
         return model
 
     def save_pretrained(self, save_directory: str) -> None:

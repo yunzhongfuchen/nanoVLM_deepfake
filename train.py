@@ -189,6 +189,7 @@ def get_dataloaders_linux(train_cfg, vlm_cfg):
 
     return train_loader, val_loader, test_loader
 
+
 def test_mmstar(model, tokenizer, test_loader, device):
     model.eval()
     total_examples = 0
@@ -218,6 +219,7 @@ def test_auth_dataset(model, tokenizer, test_loader, device):
     model.eval()
     total = 0
     correct = 0
+    print_count = 0
 
     with torch.no_grad():
         for batch in test_loader:
@@ -225,6 +227,7 @@ def test_auth_dataset(model, tokenizer, test_loader, device):
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)  # [B, T]
+            labels_cls = batch["labels_cls"].to(device)
 
             batch_size = input_ids.size(0)
 
@@ -237,13 +240,20 @@ def test_auth_dataset(model, tokenizer, test_loader, device):
                 if ans_ids.numel() == 0:
                     gt_answers.append("")
                 else:
-                    gt = tokenizer.decode(ans_ids, skip_special_tokens=True)
+                    gt = tokenizer.decode(ans_ids, skip_special_tokens=False)
                     gt_answers.append(gt.strip().lower())
 
             # 2) 让模型生成答案
-            gen_ids = model.generate(input_ids, images, attention_mask)
-            pred_answers = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
+            gen_ids, cls_pred = model.generate(input_ids, images, attention_mask)
+            pred_answers = tokenizer.batch_decode(gen_ids, skip_special_tokens=False)
             pred_answers = [p.strip().lower() for p in pred_answers]
+
+            # 只打印第一个样本的信息
+            if batch_size > 0 and print_count < 3:
+                print(f"================First sample in batch:===================")
+                print(f"  Generated Text: '{pred_answers[0]}' -> GT Text: '{gt_answers[0]}'")
+                print(f"  Classification Pred: '{cls_pred[0].item() if hasattr(cls_pred[0], 'item') else cls_pred[0]}' -> GT Label: '{labels_cls[0].item() if hasattr(labels_cls[0], 'item') else labels_cls[0]}'")
+                print_count += 1
 
             # 3) 比较预测和真实答案
             for pred, gt in zip(pred_answers, gt_answers):
@@ -274,6 +284,7 @@ def test_auth_dataset(model, tokenizer, test_loader, device):
     model.train()
     return correct / total if total > 0 else 0.0
 
+
 # Cosine learning rate schedule with warmup (from Karpathy)
 # https://github.com/karpathy/build-nanogpt/blob/master/train_gpt2.py#L353
 def get_lr(it, max_lr, max_steps):
@@ -302,7 +313,7 @@ def train(train_cfg, vlm_cfg):
             run_name = run_name.replace("full_ds", f"{total_dataset_size}samples")
         run = wandb.init(
             entity=train_cfg.wandb_entity,
-            project="nanoVLM-deepfake",
+            project="nanoVLM_deepfake",
             config={
                 "VLMConfig": asdict(vlm_cfg),
                 "TrainConfig": asdict(train_cfg)
@@ -315,7 +326,7 @@ def train(train_cfg, vlm_cfg):
         model = VisionLanguageModel.from_pretrained(vlm_cfg.vlm_checkpoint_path)
     else:
         model = VisionLanguageModel(vlm_cfg, load_backbone=vlm_cfg.vlm_load_backbone_weights)
-    
+    model.decoder.resize_token_embeddings(len(tokenizer))
     print(f"nanoVLM initialized with {sum(p.numel() for p in model.parameters()):,} parameters") 
     print(f"Training summary: {len(train_loader.dataset)} samples, {len(train_loader)} batches/epoch, batch size {train_cfg.batch_size}")
     print(f"Validation summary: {len(val_loader.dataset)} samples, {len(val_loader)} batches/epoch, batch size {train_cfg.batch_size}")
@@ -323,7 +334,7 @@ def train(train_cfg, vlm_cfg):
     # Define optimizer groups
     # Since we have pretrained vision and language backbones, but a newly initialized modality projection layer, it doesn't make sense to train them with the same learning rate
     # You could opt to fully freeze the backbones and only train the MP layer, but finetuning them with a lower learning rate makes the training as a whole easier
-    param_groups = [{'params': model.MP.parameters(), 'lr': train_cfg.lr_mp},
+    param_groups = [{'params': list(model.MP.parameters()) + list(model.classifier.parameters()), 'lr': train_cfg.lr_mp},
                     {'params': list(model.decoder.parameters()) + list(model.vision_encoder.parameters()), 'lr': train_cfg.lr_backbones}]
     optimizer = optim.AdamW(param_groups)
 
@@ -347,11 +358,12 @@ def train(train_cfg, vlm_cfg):
             input_ids = batch["input_ids"].to(device)
             labels = batch["labels"].to(device)
             attention_mask = batch["attention_mask"].to(device)
+            labels_cls = batch["labels_cls"].to(device)
 
             optimizer.zero_grad()
 
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16): # Set to float16 if your hardware doesn't support bfloat16ß
-                _, loss = model(input_ids, images, attention_mask=attention_mask, targets=labels)
+                _, loss, _ = model(input_ids, images, attention_mask=attention_mask, targets=labels, targets_cls = labels_cls)
 
             loss.backward()
 
@@ -384,9 +396,10 @@ def train(train_cfg, vlm_cfg):
                         input_ids = batch["input_ids"].to(device)
                         labels = batch["labels"].to(device)
                         attention_mask = batch["attention_mask"].to(device)
+                        labels_cls = batch["labels_cls"].to(device)
 
                         with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
-                            _, loss = model(input_ids, images, attention_mask=attention_mask, targets=labels)
+                            _, loss, _ = model(input_ids, images, attention_mask=attention_mask, targets=labels, targets_cls = labels_cls)
 
                         total_val_loss += loss.item()
                     avg_val_loss = total_val_loss / len(val_loader)
